@@ -5,7 +5,6 @@ import wave
 import os
 import openwakeword
 from openwakeword.model import Model
-from scipy.signal import butter, sosfilt, sosfilt_zi
 from gpiozero import LED
 
 # --- NEW SDK IMPORT ---
@@ -22,8 +21,7 @@ DEBOUNCE_TIME = 1.5
 SAMPLE_RATE  = 16000
 CHUNK_SAMPLES = 1280 
 
-# --- DSP & Hardware ---
-GAIN = 3.5           
+# --- Hardware ---
 LED_PIN = 17 
 QUERY_DURATION = 5.0 # Seconds to listen after wake word
 QUERY_FILE = "query.wav"
@@ -33,14 +31,6 @@ GOOGLE_API_KEY = "API_key"
 # Initialize the modern SDK Client
 client = genai.Client(api_key=GOOGLE_API_KEY)
 # ---------------------
-
-def build_bandpass_filter(low_hz=80, high_hz=7500, sample_rate=16000, order=4):
-    return butter(order, [low_hz, high_hz], btype='bandpass', fs=sample_rate, output='sos')
-
-def process_chunk(chunk, sos_filter, zi):
-    filtered, zf = sosfilt(sos_filter, chunk.astype(np.float64), zi=zi)
-    scaled = (filtered * GAIN).clip(-32768, 32767)
-    return scaled.astype(np.int16), zf
 
 def save_wav(filename, audio_data, sample_rate=16000):
     with wave.open(filename, 'w') as wf:
@@ -66,7 +56,7 @@ def ask_gemini(audio_file_path):
     except Exception as e:
         return f"Error 404: {e}"
 
-def record_query(ser, sos_filter, zi, duration_sec, sample_rate=16000):
+def record_query(ser, duration_sec, sample_rate=16000):
     target_samples = duration_sec * sample_rate
     collected = np.array([], dtype=np.int16)
     serial_buffer = bytearray()
@@ -84,11 +74,11 @@ def record_query(ser, sos_filter, zi, duration_sec, sample_rate=16000):
                 raw_audio = serial_buffer[header_pos + 4 : block_end]
                 serial_buffer = serial_buffer[block_end:]
                 
-                chunk, zi = process_chunk(np.frombuffer(raw_audio, dtype=np.int16), sos_filter, zi)
+                # Convert raw bytes directly to int16 array
+                chunk = np.frombuffer(raw_audio, dtype=np.int16)
                 collected = np.concatenate((collected, chunk))
 
     save_wav(QUERY_FILE, collected[:int(target_samples)], sample_rate)
-    return zi 
 
 def run_assistant_pipeline():
     print("Initializing Wake Word Engine...")
@@ -97,7 +87,6 @@ def run_assistant_pipeline():
     oww_model = Model(wakeword_model_paths=[alexa_path])
     model_key = list(oww_model.models.keys())[0]
     
-    sos_filter = build_bandpass_filter()
     status_led = LED(LED_PIN)
     status_led.off()
 
@@ -108,7 +97,6 @@ def run_assistant_pipeline():
         serial_buffer = bytearray()
         audio_accumulator = np.array([], dtype=np.int16)
         last_detection_time = 0.0
-        zi = sosfilt_zi(sos_filter) * 0.0
 
         print("\n=== Assistant Online. Say 'Alexa' to begin. ===")
 
@@ -124,7 +112,8 @@ def run_assistant_pipeline():
                     raw_audio = serial_buffer[header_pos + 4 : block_end]
                     serial_buffer = serial_buffer[block_end:]
 
-                    chunk, zi = process_chunk(np.frombuffer(raw_audio, dtype=np.int16), sos_filter, zi)
+                    # Extract raw chunk and append directly
+                    chunk = np.frombuffer(raw_audio, dtype=np.int16)
                     audio_accumulator = np.concatenate((audio_accumulator, chunk))
 
                     if len(audio_accumulator) >= CHUNK_SAMPLES:
@@ -138,7 +127,7 @@ def run_assistant_pipeline():
                                 print(f"\n[!!!] WAKE WORD DETECTED (Score: {score:.3f})")
                                 
                                 status_led.on()
-                                zi = record_query(ser, sos_filter, zi, QUERY_DURATION, SAMPLE_RATE)
+                                record_query(ser, QUERY_DURATION, SAMPLE_RATE)
                                 status_led.off()
                                 
                                 answer = ask_gemini(QUERY_FILE)
